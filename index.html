@@ -1,4 +1,272 @@
-Hello World
+<h1 id="toc">TOC</h1>
+<ul>
+<li><a href="#introduction">Introduction</a></li>
+<li><a href="#linux-network-queues-overview">Linux network queues overview</a></li>
+<li><a href="#fitting-the-sysctl-variables-into-the-linux-network-flow">Fitting the sysctl variables into the Linux network flow</a><ul>
+<li>Ingress - they&#39;re coming</li>
+<li>Egress - they&#39;re leaving</li>
+</ul>
+</li>
+<li><a href="#what-why-and-how---network-and-sysctl-parameters">What, Why and How - network and sysctl parameters</a><ul>
+<li>Ring Buffer - rx,tx</li>
+<li>Interrupt Coalescence (IC) - rx-usecs, tx-usecs, rx-frames, tx-frames (hardware IRQ)</li>
+<li>Interrupt Coalescing (soft IRQ) and Ingress QDisc</li>
+<li>Egress QDisc - txqueuelen and default_qdisc</li>
+<li>TCP Read and Write Buffers/Queues</li>
+<li>Honorable mentions - TCP FSM and congestion algorithm</li>
+</ul>
+</li>
+<li><a href="#network-tools-for-testing-and-monitoring">Network tools</a></li>
+<li><a href="#references">References</a></li>
+</ul>
+<h1 id="introduction">Introduction</h1>
+<p>Sometimes people are looking for <a href="https://www.kernel.org/doc/Documentation/networking/ip-sysctl.txt">sysctl</a> cargo cult values that bring high throughput and low latency with no trade-off and that works on every occasion. That&#39;s not realistic, although we can say that the <strong>newer kernel versions are very well tuned by default</strong>. In fact, you might <a href="https://medium.com/@duhroach/the-bandwidth-delay-problem-c6a2a578b211">hurt performance if you mess with the defaults</a>.</p>
+<p>This brief tutorial shows <strong>where some of the most used and quoted sysctl/network parameters are located into the Linux network flow</strong>, it was heavily inspired by <a href="https://blog.packagecloud.io/eng/2016/10/11/monitoring-tuning-linux-networking-stack-receiving-data-illustrated/">the illustrated guide to Linux networking stack</a> and many of <a href="https://blog.cloudflare.com/how-to-achieve-low-latency/">Marek Majkowski&#39;s posts</a>. </p>
+<blockquote>
+<h4 id="feel-free-to-send-corrections-and-suggestions-">Feel free to send corrections and suggestions! :)</h4>
+</blockquote>
+<h1 id="linux-network-queues-overview">Linux network queues overview</h1>
+<p><img src="/img/linux_network_flow.png" alt="linux network queues" title="A graphic representation of linux/kernel network main buffer / queues"></p>
+<h1 id="fitting-the-sysctl-variables-into-the-linux-network-flow">Fitting the sysctl variables into the Linux network flow</h1>
+<h2 id="ingress-they-re-coming">Ingress - they&#39;re coming</h2>
+<ol>
+<li>Packets arrive at the NIC</li>
+<li>NIC will verify <code>MAC</code> (if not on promiscuous mode) and <code>FCS</code> and decide to drop or to continue</li>
+<li>NIC will <a href="https://en.wikipedia.org/wiki/Direct_memory_access">DMA packets at RAM</a>, in a region previously prepared (mapped) by the driver</li>
+<li>NIC will enqueue references to the packets at receive <a href="https://en.wikipedia.org/wiki/Circular_buffer">ring buffer</a> queue <code>rx</code> until <code>rx-usecs</code> timeout or <code>rx-frames</code></li>
+<li>NIC will raise a <code>hard IRQ</code></li>
+<li>CPU will run the <code>IRQ handler</code> that runs the driver&#39;s code</li>
+<li>Driver will <code>schedule a NAPI</code>, clear the <code>hard IRQ</code> and return</li>
+<li>Driver raise a <code>soft IRQ (NET_RX_SOFTIRQ)</code></li>
+<li>NAPI will poll data from the receive ring buffer until <code>netdev_budget_usecs</code> timeout or <code>netdev_budget</code> and <code>dev_weight</code> packets</li>
+<li>Linux will also allocated memory to <code>sk_buff</code></li>
+<li>Linux fills the metadata: protocol, interface, setmacheader, removes ethernet</li>
+<li>Linux will pass the skb to the kernel stack (<code>netif_receive_skb</code>)</li>
+<li>It will set the network header, clone <code>skb</code> to taps (i.e. tcpdump) and pass it to tc ingress</li>
+<li>Packets are handled to a qdisc sized <code>netdev_max_backlog</code> with its algorithm defined by <code>default_qdisc</code></li>
+<li>It calls <code>ip_rcv</code> and packets are handled to IP</li>
+<li>It calls netfilter (<code>PREROUTING</code>)</li>
+<li>It looks at the routing table, if forwarding or local</li>
+<li>If it&#39;s local it calls netfilter (<code>LOCAL_IN</code>)</li>
+<li>It calls the L4 protocol (for instance <code>tcp_v4_rcv</code>)</li>
+<li>It finds the right socket</li>
+<li>It goes to the tcp finite state machine</li>
+<li>Enqueue the packet to  the receive buffer and sized as <code>tcp_rmem</code> rules<ol>
+<li>If <code>tcp_moderate_rcvbuf</code> is enabled kernel will auto-tune the receive buffer</li>
+</ol>
+</li>
+<li>Kernel will signalize that there is data available to apps (epoll or any polling system)</li>
+<li>Application wakes up and reads the data</li>
+</ol>
+<h2 id="egress-they-re-leaving">Egress - they&#39;re leaving</h2>
+<ol>
+<li>Application sends message (<code>sendmsg</code> or other)</li>
+<li>TCP send message allocates skb_buff</li>
+<li>It enqueues skb to the socket write buffer of <code>tcp_wmem</code> size</li>
+<li>Builds the TCP header (src and dst port, checksum)</li>
+<li>Calls L3 handler (in this case <code>ipv4</code> on <code>tcp_write_xmit</code> and <code>tcp_transmit_skb</code>)</li>
+<li>L3 (<code>ip_queue_xmit</code>) does its work: build ip header and call netfilter (<code>LOCAL_OUT</code>)</li>
+<li>Calls output route action</li>
+<li>Calls netfilter (<code>POST_ROUTING</code>)</li>
+<li>Fragment the packet (<code>ip_output</code>)</li>
+<li>Calls L2 send function (<code>dev_queue_xmit</code>)</li>
+<li>Feeds the output (QDisc) queue of <code>txqueuelen</code> length with its algorithm <code>default_qdisc</code></li>
+<li>The driver code enqueue the packets at the <code>ring buffer tx</code></li>
+<li>The driver will do a <code>soft IRQ (NET_TX_SOFTIRQ)</code> after <code>tx-usecs</code> timeout or <code>tx-frames</code></li>
+<li>Re-enable hard IRQ to NIC</li>
+<li>Driver will map all the packets (to be sent) to some DMA&#39;ed region</li>
+<li>NIC fetches the packets (via DMA) from RAM to transmit</li>
+<li>After the transmission NIC will raise a <code>hard IRQ</code> to signal its completion</li>
+<li>The driver will handle this IRQ (turn it off)</li>
+<li>And schedule (<code>soft IRQ</code>) the NAPI poll system </li>
+<li>NAPI will handle the receive packets signaling and free the RAM</li>
+</ol>
+<h1 id="what-why-and-how-network-and-sysctl-parameters">What, Why and How - network and sysctl parameters</h1>
+<h2 id="ring-buffer-rx-tx">Ring Buffer - rx,tx</h2>
+<ul>
+<li><strong>What</strong> - the driver receive/send queue a single or multiple queues with a fixed size, usually implemented as FIFO, it is located at RAM</li>
+<li><strong>Why</strong> - buffer to smoothly accept bursts of connections without dropping them, you might need to increase these queues when you see drops or overrun, aka there are more packets coming than the kernel is able to consume them, the side effect might be increased latency.</li>
+<li><strong>How:</strong><ul>
+<li><strong>Check command:</strong> <code>ethtool -g ethX</code></li>
+<li><strong>Change command:</strong> <code>ethtool -G ethX rx value tx value</code></li>
+<li><strong>How to monitor:</strong> <code>ethtool -S ethX | grep -e &quot;err&quot; -e &quot;drop&quot; -e &quot;over&quot; -e &quot;miss&quot; -e &quot;timeout&quot; -e &quot;reset&quot; -e &quot;restar&quot; -e &quot;collis&quot; -e &quot;over&quot; | grep -v &quot;\: 0&quot;</code></li>
+</ul>
+</li>
+</ul>
+<h2 id="interrupt-coalescence-ic-rx-usecs-tx-usecs-rx-frames-tx-frames-hardware-irq-">Interrupt Coalescence (IC) - rx-usecs, tx-usecs, rx-frames, tx-frames (hardware IRQ)</h2>
+<ul>
+<li><strong>What</strong> - number of microseconds/frames to wait before raising a hardIRQ, from the NIC perspective it&#39;ll DMA data packets until this timeout/number of frames</li>
+<li><strong>Why</strong> - reduce CPUs usage, hard IRQ, might increase throughput at cost of latency.</li>
+<li><strong>How:</strong><ul>
+<li><strong>Check command:</strong> <code>ethtool -c ethX</code></li>
+<li><strong>Change command:</strong> <code>ethtool -C ethX rx-usecs value tx-usecs value</code></li>
+<li><strong>How to monitor:</strong> <code>cat /proc/interrupts</code> </li>
+</ul>
+</li>
+</ul>
+<h2 id="interrupt-coalescing-soft-irq-and-ingress-qdisc">Interrupt Coalescing (soft IRQ) and Ingress QDisc</h2>
+<ul>
+<li><strong>What</strong> - maximum number of microseconds in one <a href="https://en.wikipedia.org/wiki/New_API">NAPI</a> polling cycle. Polling will exit when either <code>netdev_budget_usecs</code> have elapsed during the poll cycle or the number of packets processed reaches  <code>netdev_budget</code>.</li>
+<li><strong>Why</strong> - instead of reacting to tons of softIRQ, the driver keeps polling data; keep an eye on <code>dropped</code> (# of packets that were dropped because <code>netdev_max_backlog</code> was exceeded) and <code>squeezed</code> (# of times ksoftirq ran out of <code>netdev_budget</code> or time slice with work remaining).</li>
+<li><strong>How:</strong><ul>
+<li><strong>Check command:</strong> <code>sysctl net.core.netdev_budget_usecs</code></li>
+<li><strong>Change command:</strong> <code>sysctl -w net.core.netdev_budget_usecs value</code></li>
+<li><strong>How to monitor:</strong> <code>cat /proc/net/softnet_stat</code>; or a <a href="https://raw.githubusercontent.com/majek/dump/master/how-to-receive-a-packet/softnet.sh">better tool</a></li>
+</ul>
+</li>
+<li><strong>What</strong> - <code>netdev_budget</code> is the maximum number of packets taken from all interfaces in one polling cycle (NAPI poll). In one polling cycle interfaces which are registered to polling are probed in a round-robin manner. Also, a polling cycle may not exceed <code>netdev_budget_usecs</code> microseconds, even if <code>netdev_budget</code> has not been exhausted.</li>
+<li><strong>How:</strong><ul>
+<li><strong>Check command:</strong> <code>sysctl net.core.netdev_budget</code></li>
+<li><strong>Change command:</strong> <code>sysctl -w net.core.netdev_budget value</code></li>
+<li><strong>How to monitor:</strong> <code>cat /proc/net/softnet_stat</code>; or a <a href="https://raw.githubusercontent.com/majek/dump/master/how-to-receive-a-packet/softnet.sh">better tool</a></li>
+</ul>
+</li>
+<li><strong>What</strong> - <code>dev_weight</code> is the maximum number of packets that kernel can handle on a NAPI interrupt, it&#39;s a Per-CPU variable. For drivers that support LRO or GRO_HW, a hardware aggregated packet is counted as one packet in this.</li>
+<li><strong>How:</strong><ul>
+<li><strong>Check command:</strong> <code>sysctl net.core.dev_weight</code></li>
+<li><strong>Change command:</strong> <code>sysctl -w net.core.dev_weight value</code></li>
+<li><strong>How to monitor:</strong> <code>cat /proc/net/softnet_stat</code>; or a <a href="https://raw.githubusercontent.com/majek/dump/master/how-to-receive-a-packet/softnet.sh">better tool</a></li>
+</ul>
+</li>
+<li><strong>What</strong> - <code>netdev_max_backlog</code> is the maximum number  of  packets,  queued  on  the  INPUT side (<em>the ingress qdisc</em>), when the interface receives packets faster than kernel can process them.</li>
+<li><strong>How:</strong><ul>
+<li><strong>Check command:</strong> <code>sysctl net.core.netdev_max_backlog</code></li>
+<li><strong>Change command:</strong> <code>sysctl -w net.core.netdev_max_backlog value</code></li>
+<li><strong>How to monitor:</strong> <code>cat /proc/net/softnet_stat</code>; or a <a href="https://raw.githubusercontent.com/majek/dump/master/how-to-receive-a-packet/softnet.sh">better tool</a></li>
+</ul>
+</li>
+</ul>
+<h2 id="egress-qdisc-txqueuelen-and-default_qdisc">Egress QDisc - txqueuelen and default_qdisc</h2>
+<ul>
+<li><strong>What</strong> - <code>txqueuelen</code> is the maximum number of packets, queued on the OUTPUT side.</li>
+<li><strong>Why</strong> - a buffer/queue to face connection burst and also to apply <a href="http://tldp.org/HOWTO/Traffic-Control-HOWTO/intro.html">tc (traffic control).</a></li>
+<li><strong>How:</strong><ul>
+<li><strong>Check command:</strong> <code>ifconfig ethX</code></li>
+<li><strong>Change command:</strong> <code>ifconfig ethX txqueuelen value</code></li>
+<li><strong>How to monitor:</strong> <code>ip -s link</code> </li>
+</ul>
+</li>
+<li><strong>What</strong> - <code>default_qdisc</code> is the default queuing discipline to use for network devices.</li>
+<li><strong>Why</strong> - each application has different load and need to traffic control and it is used also to fight against <a href="https://www.bufferbloat.net/projects/codel/wiki/">bufferbloat</a></li>
+<li><strong>How:</strong><ul>
+<li><strong>Check command:</strong> <code>sysctl net.core.default_qdisc</code></li>
+<li><strong>Change command:</strong> <code>sysctl -w net.core.default_qdisc value</code></li>
+<li><strong>How to monitor:</strong>   <code>tc -s qdisc ls dev ethX</code></li>
+</ul>
+</li>
+</ul>
+<h2 id="tcp-read-and-write-buffers-queues">TCP Read and Write Buffers/Queues</h2>
+<ul>
+<li><strong>What</strong> - <code>tcp_rmem</code> - min (size used under memory pressure), default (initial size), max (maximum size) - size of receive buffer used by TCP sockets.</li>
+<li><strong>Why</strong> - the application buffer/queue to the write/send data, <a href="https://blog.cloudflare.com/the-story-of-one-latency-spike/">understand its consequences can help a lot</a>.</li>
+<li><strong>How:</strong><ul>
+<li><strong>Check command:</strong> <code>sysctl net.ipv4.tcp_rmem</code></li>
+<li><strong>Change command:</strong> <code>sysctl -w net.ipv4.tcp_rmem=&quot;min default max&quot;</code>; when changing default value, remember to restart your user space app (i.e. your web server, nginx, etc)</li>
+<li><strong>How to monitor:</strong> <code>cat /proc/net/sockstat</code></li>
+</ul>
+</li>
+<li><strong>What</strong> - <code>tcp_wmem</code> - min (size used under memory pressure), default (initial size), max (maximum size) - size of send buffer used by TCP sockets.</li>
+<li><strong>How:</strong><ul>
+<li><strong>Check command:</strong> <code>sysctl net.ipv4.tcp_wmem</code></li>
+<li><strong>Change command:</strong> <code>sysctl -w net.ipv4.tcp_wmem=&quot;min default max&quot;</code>; when changing default value, remember to restart your user space app (i.e. your web server, nginx, etc)</li>
+<li><strong>How to monitor:</strong> <code>cat /proc/net/sockstat</code></li>
+</ul>
+</li>
+<li><strong>What</strong> <code>tcp_moderate_rcvbuf</code> - If set, TCP performs receive buffer auto-tuning, attempting to automatically size the buffer.</li>
+<li><strong>How:</strong><ul>
+<li><strong>Check command:</strong> <code>sysctl net.ipv4.tcp_moderate_rcvbuf</code></li>
+<li><strong>Change command:</strong> <code>sysctl -w net.ipv4.tcp_moderate_rcvbuf value</code></li>
+<li><strong>How to monitor:</strong> <code>cat /proc/net/sockstat</code></li>
+</ul>
+</li>
+</ul>
+<h2 id="honorable-mentions-tcp-fsm-and-congestion-algorithm">Honorable mentions - TCP FSM and congestion algorithm</h2>
+<ul>
+<li><code>sysctl net.core.somaxconn</code> - provides an upper limit on the value of the backlog parameter passed to the <a href="https://eklitzke.org/how-tcp-sockets-work"><code>listen()</code> function</a>, known in userspace as <code>SOMAXCONN</code>. If you change this value, you should also change your application to a compatible value (i.e. <a href="http://nginx.org/en/docs/http/ngx_http_core_module.html#listen">nginx backlog</a>).</li>
+<li><code>cat /proc/sys/net/ipv4/tcp_fin_timeout</code> - this specifies the number of seconds to wait for a final FIN packet before the socket is forcibly closed.  This is strictly a violation of the TCP specification but required to prevent denial-of-service attacks.</li>
+<li><code>cat /proc/sys/net/ipv4/tcp_available_congestion_control</code> - shows the available congestion control choices that are registered.</li>
+<li><code>cat /proc/sys/net/ipv4/tcp_congestion_control</code> - sets the congestion control algorithm to be used for new connections.</li>
+<li><code>cat /proc/sys/net/ipv4/tcp_max_syn_backlog</code> - sets the maximum number of queued connection requests which have still not received an acknowledgment from the connecting client; if this number is exceeded, the kernel will begin dropping requests.</li>
+<li><code>cat /proc/sys/net/ipv4/tcp_syncookies</code> - enables/disables <a href="https://en.wikipedia.org/wiki/SYN_cookies">syn cookies</a>, useful for protecting against <a href="https://www.cloudflare.com/learning/ddos/syn-flood-ddos-attack/">syn flood attacks</a>.</li>
+<li><code>cat /proc/sys/net/ipv4/tcp_slow_start_after_idle</code> - enables/disables tcp slow start.</li>
+</ul>
+<p><strong>How to monitor:</strong> </p>
+<ul>
+<li><code>netstat -atn | awk &#39;/tcp/ {print $6}&#39; | sort | uniq -c</code> - summary by state</li>
+<li><code>ss -neopt state time-wait | wc -l</code> - counters by a specific state: <code>established</code>, <code>syn-sent</code>, <code>syn-recv</code>, <code>fin-wait-1</code>, <code>fin-wait-2</code>, <code>time-wait</code>, <code>closed</code>, <code>close-wait</code>, <code>last-ack</code>, <code>listening</code>, <code>closing</code></li>
+<li><code>netstat -st</code> - tcp stats summary</li>
+<li><code>nstat -a</code> - human-friendly tcp stats summary</li>
+<li><code>cat /proc/net/sockstat</code> - summarized socket stats</li>
+<li><code>cat /proc/net/tcp</code> - detailed stats, see each field meaning at the <a href="https://www.kernel.org/doc/Documentation/networking/proc_net_tcp.txt">kernel docs</a></li>
+<li><code>cat /proc/net/netstat</code> - <code>ListenOverflows</code> and <code>ListenDrops</code> are important fields to keep an eye on<ul>
+<li><code>cat /proc/net/netstat | awk &#39;(f==0) { i=1; while ( i&lt;=NF) {n[i] = $i; i++ }; f=1; next} \
+(f==1){ i=2; while ( i&lt;=NF){ printf &quot;%s = %d\n&quot;, n[i], $i; i++}; f=0} &#39; | grep -v &quot;= 0</code>; a <a href="https://sa-chernomor.livejournal.com/9858.html">human readable <code>/proc/net/netstat</code></a></li>
+</ul>
+</li>
+</ul>
+<p><img src="https://upload.wikimedia.org/wikipedia/commons/a/a2/Tcp_state_diagram_fixed.svg" alt="tcp finite state machine" title="A graphic representation of tcp tcp finite state machine">
+Source: <a href="https://commons.wikimedia.org/wiki/File:Tcp_state_diagram_fixed_new.svg">https://commons.wikimedia.org/wiki/File:Tcp_state_diagram_fixed_new.svg</a></p>
+<h1 id="network-tools-for-testing-and-monitoring">Network tools for testing and monitoring</h1>
+<ul>
+<li><a href="https://iperf.fr/">iperf3</a> - network throughput</li>
+<li><a href="https://github.com/tsenart/vegeta">vegeta</a> - HTTP load testing tool</li>
+<li><a href="https://github.com/firehol/netdata">netdata</a> - system for distributed real-time performance and health monitoring</li>
+</ul>
+<h1 id="references">References</h1>
+<ul>
+<li><a href="https://www.kernel.org/doc/Documentation/sysctl/net.txt">https://www.kernel.org/doc/Documentation/sysctl/net.txt</a></li>
+<li><a href="https://www.kernel.org/doc/Documentation/networking/ip-sysctl.txt">https://www.kernel.org/doc/Documentation/networking/ip-sysctl.txt</a></li>
+<li><a href="https://www.kernel.org/doc/Documentation/networking/scaling.txt">https://www.kernel.org/doc/Documentation/networking/scaling.txt</a></li>
+<li><a href="https://www.kernel.org/doc/Documentation/networking/proc_net_tcp.txt">https://www.kernel.org/doc/Documentation/networking/proc_net_tcp.txt</a></li>
+<li><a href="https://www.kernel.org/doc/Documentation/networking/multiqueue.txt">https://www.kernel.org/doc/Documentation/networking/multiqueue.txt</a></li>
+<li><a href="http://man7.org/linux/man-pages/man7/tcp.7.html">http://man7.org/linux/man-pages/man7/tcp.7.html</a></li>
+<li><a href="http://man7.org/linux/man-pages/man8/tc.8.html">http://man7.org/linux/man-pages/man8/tc.8.html</a></li>
+<li><a href="http://www.ece.virginia.edu/cheetah/documents/papers/TCPlinux.pdf">http://www.ece.virginia.edu/cheetah/documents/papers/TCPlinux.pdf</a></li>
+<li><a href="https://netdevconf.org/1.2/papers/bbr-netdev-1.2.new.new.pdf">https://netdevconf.org/1.2/papers/bbr-netdev-1.2.new.new.pdf</a></li>
+<li><a href="https://blog.cloudflare.com/how-to-receive-a-million-packets/">https://blog.cloudflare.com/how-to-receive-a-million-packets/</a></li>
+<li><a href="https://blog.cloudflare.com/how-to-achieve-low-latency/">https://blog.cloudflare.com/how-to-achieve-low-latency/</a></li>
+<li><a href="https://blog.packagecloud.io/eng/2016/06/22/monitoring-tuning-linux-networking-stack-receiving-data/">https://blog.packagecloud.io/eng/2016/06/22/monitoring-tuning-linux-networking-stack-receiving-data/</a></li>
+<li><a href="https://www.youtube.com/watch?v=6Fl1rsxk4JQ">https://www.youtube.com/watch?v=6Fl1rsxk4JQ</a></li>
+<li><a href="https://oxnz.github.io/2016/05/03/performance-tuning-networking/">https://oxnz.github.io/2016/05/03/performance-tuning-networking/</a></li>
+<li><a href="https://www.intel.com/content/dam/www/public/us/en/documents/reference-guides/xl710-x710-performance-tuning-linux-guide.pdf">https://www.intel.com/content/dam/www/public/us/en/documents/reference-guides/xl710-x710-performance-tuning-linux-guide.pdf</a></li>
+<li><a href="https://access.redhat.com/sites/default/files/attachments/20150325_network_performance_tuning.pdf">https://access.redhat.com/sites/default/files/attachments/20150325_network_performance_tuning.pdf</a></li>
+<li><a href="https://medium.com/@matteocroce/linux-and-freebsd-networking-cbadcdb15ddd">https://medium.com/@matteocroce/linux-and-freebsd-networking-cbadcdb15ddd</a></li>
+<li><a href="https://blogs.technet.microsoft.com/networking/2009/08/12/where-do-resets-come-from-no-the-stork-does-not-bring-them/">https://blogs.technet.microsoft.com/networking/2009/08/12/where-do-resets-come-from-no-the-stork-does-not-bring-them/</a></li>
+<li><a href="https://www.intel.com/content/dam/www/public/us/en/documents/white-papers/multi-core-processor-based-linux-paper.pdf">https://www.intel.com/content/dam/www/public/us/en/documents/white-papers/multi-core-processor-based-linux-paper.pdf</a></li>
+<li><a href="http://syuu.dokukino.com/2013/05/linux-kernel-features-for-high-speed.html">http://syuu.dokukino.com/2013/05/linux-kernel-features-for-high-speed.html</a></li>
+<li><a href="https://www.bufferbloat.net/projects/codel/wiki/Best_practices_for_benchmarking_Codel_and_FQ_Codel/">https://www.bufferbloat.net/projects/codel/wiki/Best_practices_for_benchmarking_Codel_and_FQ_Codel/</a></li>
+<li><a href="https://software.intel.com/en-us/articles/setting-up-intel-ethernet-flow-director">https://software.intel.com/en-us/articles/setting-up-intel-ethernet-flow-director</a></li>
+<li><a href="https://courses.engr.illinois.edu/cs423/sp2014/Lectures/LinuxDriver.pdf">https://courses.engr.illinois.edu/cs423/sp2014/Lectures/LinuxDriver.pdf</a></li>
+<li><a href="https://www.coverfire.com/articles/queueing-in-the-linux-network-stack/">https://www.coverfire.com/articles/queueing-in-the-linux-network-stack/</a></li>
+<li><a href="http://vger.kernel.org/~davem/skb.html">http://vger.kernel.org/~davem/skb.html</a></li>
+<li><a href="https://www.missoulapubliclibrary.org/ftp/LinuxJournal/LJ13-07.pdf">https://www.missoulapubliclibrary.org/ftp/LinuxJournal/LJ13-07.pdf</a></li>
+<li><a href="https://opensourceforu.com/2016/10/network-performance-monitoring/">https://opensourceforu.com/2016/10/network-performance-monitoring/</a></li>
+<li><a href="https://www.yumpu.com/en/document/view/55400902/an-adventure-of-analysis-and-optimisation-of-the-linux-networking-stack">https://www.yumpu.com/en/document/view/55400902/an-adventure-of-analysis-and-optimisation-of-the-linux-networking-stack</a></li>
+<li><a href="https://lwn.net/Articles/616241/">https://lwn.net/Articles/616241/</a></li>
+<li><a href="https://medium.com/@duhroach/tools-to-profile-networking-performance-3141870d5233">https://medium.com/@duhroach/tools-to-profile-networking-performance-3141870d5233</a></li>
+<li><a href="https://www.lmax.com/blog/staff-blogs/2016/05/06/navigating-linux-kernel-network-stack-receive-path/">https://www.lmax.com/blog/staff-blogs/2016/05/06/navigating-linux-kernel-network-stack-receive-path/</a></li>
+<li><a href="https://es.net/host-tuning/100g-tuning/">https://es.net/host-tuning/100g-tuning/</a></li>
+<li><a href="http://tcpipguide.com/free/t_TCPOperationalOverviewandtheTCPFiniteStateMachineF-2.htm">http://tcpipguide.com/free/t_TCPOperationalOverviewandtheTCPFiniteStateMachineF-2.htm</a></li>
+<li><a href="http://veithen.github.io/2014/01/01/how-tcp-backlog-works-in-linux.html">http://veithen.github.io/2014/01/01/how-tcp-backlog-works-in-linux.html</a></li>
+<li><a href="https://people.cs.clemson.edu/~westall/853/tcpperf.pdf">https://people.cs.clemson.edu/~westall/853/tcpperf.pdf</a></li>
+<li><a href="http://tldp.org/HOWTO/Traffic-Control-HOWTO/classless-qdiscs.html">http://tldp.org/HOWTO/Traffic-Control-HOWTO/classless-qdiscs.html</a></li>
+<li><a href="https://es.net/assets/Papers-and-Publications/100G-Tuning-TechEx2016.tierney.pdf">https://es.net/assets/Papers-and-Publications/100G-Tuning-TechEx2016.tierney.pdf</a></li>
+<li><a href="https://www.kernel.org/doc/ols/2009/ols2009-pages-169-184.pdf">https://www.kernel.org/doc/ols/2009/ols2009-pages-169-184.pdf</a></li>
+<li><a href="https://devcentral.f5.com/articles/the-send-buffer-in-depth-21845">https://devcentral.f5.com/articles/the-send-buffer-in-depth-21845</a></li>
+<li><a href="http://packetbomb.com/understanding-throughput-and-tcp-windows/">http://packetbomb.com/understanding-throughput-and-tcp-windows/</a></li>
+<li><a href="https://www.speedguide.net/bdp.php">https://www.speedguide.net/bdp.php</a></li>
+<li><a href="https://www.switch.ch/network/tools/tcp_throughput/">https://www.switch.ch/network/tools/tcp_throughput/</a></li>
+<li><a href="https://www.ibm.com/support/knowledgecenter/en/SSQPD3_2.6.0/com.ibm.wllm.doc/usingethtoolrates.html">https://www.ibm.com/support/knowledgecenter/en/SSQPD3_2.6.0/com.ibm.wllm.doc/usingethtoolrates.html</a></li>
+<li><a href="https://blog.tsunanet.net/2011/03/out-of-socket-memory.html">https://blog.tsunanet.net/2011/03/out-of-socket-memory.html</a></li>
+<li><a href="https://unix.stackexchange.com/questions/12985/how-to-check-rx-ring-max-backlog-and-max-syn-backlog-size">https://unix.stackexchange.com/questions/12985/how-to-check-rx-ring-max-backlog-and-max-syn-backlog-size</a></li>
+<li><a href="https://serverfault.com/questions/498245/how-to-reduce-number-of-time-wait-processes">https://serverfault.com/questions/498245/how-to-reduce-number-of-time-wait-processes</a></li>
+<li><a href="https://unix.stackexchange.com/questions/419518/how-to-tell-how-much-memory-tcp-buffers-are-actually-using">https://unix.stackexchange.com/questions/419518/how-to-tell-how-much-memory-tcp-buffers-are-actually-using</a></li>
+<li><a href="https://eklitzke.org/how-tcp-sockets-work">https://eklitzke.org/how-tcp-sockets-work</a></li>
+<li><a href="https://www.linux.com/learn/intro-to-linux/2017/7/introduction-ss-command">https://www.linux.com/learn/intro-to-linux/2017/7/introduction-ss-command</a></li>
+<li><a href="https://staaldraad.github.io/2017/12/20/netstat-without-netstat/">https://staaldraad.github.io/2017/12/20/netstat-without-netstat/</a></li>
+<li><a href="https://loicpefferkorn.net/2016/03/linux-network-metrics-why-you-should-use-nstat-instead-of-netstat/">https://loicpefferkorn.net/2016/03/linux-network-metrics-why-you-should-use-nstat-instead-of-netstat/</a></li>
+<li><a href="http://assimilationsystems.com/2015/12/29/bufferbloat-network-best-practice/">http://assimilationsystems.com/2015/12/29/bufferbloat-network-best-practice/</a></li>
+</ul>
 <img id="blah" src="https://raw.githubusercontent.com/leiwen83/leiwen83.github.io/master/net_diagram.jpg" alt="your image" />
 <div id="container"></div>
 <link rel="stylesheet" href="https://imsun.github.io/gitment/style/default.css">
